@@ -2223,6 +2223,177 @@ func Test_TerminatedWorkers_NoAutoscaler(t *testing.T) {
 	assert.Len(t, podList.Items, expectedNumWorkerPods)
 }
 
+func Test_UnhealthyWorkerPodAlreadyDeleted(t *testing.T) {
+	setupTest(t)
+
+	cluster := testRayCluster.DeepCopy()
+	cluster.Spec.WorkerGroupSpecs[0].ScaleStrategy.WorkersToDelete = []string{}
+	cluster.Spec.EnableInTreeAutoscaling = nil
+	groupName := cluster.Spec.WorkerGroupSpecs[0].GroupName
+
+	ctx := context.Background()
+	var failedPodName string
+	fakeClient := newStaleDeleteClient(&failedPodName, testPods...)
+
+	podList := corev1.PodList{}
+	require.NoError(t, fakeClient.List(ctx, &podList, &client.ListOptions{
+		LabelSelector: workerSelector,
+		Namespace:     namespaceStr,
+	}))
+	require.NotEmpty(t, podList.Items)
+	for i := range podList.Items {
+		podList.Items[i].Status.Phase = corev1.PodRunning
+		require.NoError(t, fakeClient.Status().Update(ctx, &podList.Items[i]))
+	}
+
+	failedPodName = podList.Items[0].Name
+	podList.Items[0].Status.Phase = corev1.PodFailed
+	require.NoError(t, fakeClient.Status().Update(ctx, &podList.Items[0]))
+
+	recorder := events.NewFakeRecorder(100)
+	scaleExpectation := expectations.NewRayClusterScaleExpectation(fakeClient)
+	testRayClusterReconciler := &RayClusterReconciler{
+		Client:                     fakeClient,
+		Recorder:                   recorder,
+		Scheme:                     scheme.Scheme,
+		rayClusterScaleExpectation: scaleExpectation,
+	}
+
+	err := testRayClusterReconciler.reconcilePods(ctx, cluster)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, utils.ErrFailedDeleteWorkerPod)
+
+	for len(recorder.Events) > 0 {
+		event := <-recorder.Events
+		assert.NotContains(t, event, string(utils.FailedToDeleteWorkerPod))
+	}
+
+	assert.False(t, scaleExpectation.IsSatisfied(ctx, namespaceStr, cluster.Name, groupName))
+
+	staleFailedPod := podList.Items[0]
+	failedPodName = ""
+	require.NoError(t, fakeClient.Delete(ctx, &staleFailedPod))
+	assert.True(t, scaleExpectation.IsSatisfied(ctx, namespaceStr, cluster.Name, groupName))
+}
+
+func Test_UnhealthyWorkerPodAlreadyDeleted_ContinuesDeleting(t *testing.T) {
+	setupTest(t)
+
+	cluster := testRayCluster.DeepCopy()
+	cluster.Spec.WorkerGroupSpecs[0].ScaleStrategy.WorkersToDelete = []string{}
+	cluster.Spec.EnableInTreeAutoscaling = nil
+
+	ctx := context.Background()
+	var staleFailedPodName string
+	fakeClient := newStaleDeleteClient(&staleFailedPodName, testPods...)
+
+	podList := corev1.PodList{}
+	listOptions := &client.ListOptions{
+		LabelSelector: workerSelector,
+		Namespace:     namespaceStr,
+	}
+	require.NoError(t, fakeClient.List(ctx, &podList, listOptions))
+	require.GreaterOrEqual(t, len(podList.Items), 3)
+	for i := range podList.Items {
+		podList.Items[i].Status.Phase = corev1.PodRunning
+		require.NoError(t, fakeClient.Status().Update(ctx, &podList.Items[i]))
+	}
+
+	staleFailedPodName = podList.Items[0].Name
+	secondFailedPodName := podList.Items[1].Name
+	for i := range 2 {
+		podList.Items[i].Status.Phase = corev1.PodFailed
+		require.NoError(t, fakeClient.Status().Update(ctx, &podList.Items[i]))
+	}
+
+	testRayClusterReconciler := &RayClusterReconciler{
+		Client:                     fakeClient,
+		Recorder:                   events.NewFakeRecorder(100),
+		Scheme:                     scheme.Scheme,
+		rayClusterScaleExpectation: expectations.NewRayClusterScaleExpectation(fakeClient),
+	}
+
+	err := testRayClusterReconciler.reconcilePods(ctx, cluster)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, utils.ErrFailedDeleteWorkerPod)
+
+	pod := corev1.Pod{}
+	err = fakeClient.Get(ctx, client.ObjectKey{Namespace: namespaceStr, Name: secondFailedPodName}, &pod)
+	assert.True(t, k8serrors.IsNotFound(err), "expected Pod %s to be deleted, got err: %v", secondFailedPodName, err)
+
+	require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Namespace: namespaceStr, Name: staleFailedPodName}, &pod))
+	remaining := corev1.PodList{}
+	require.NoError(t, fakeClient.List(ctx, &remaining, listOptions))
+	assert.Len(t, remaining.Items, len(podList.Items)-1)
+}
+
+func Test_UnhealthyHeadPodAlreadyDeleted(t *testing.T) {
+	setupTest(t)
+
+	cluster := testRayCluster.DeepCopy()
+	cluster.Spec.WorkerGroupSpecs = nil
+
+	ctx := context.Background()
+	var staleHeadPodName string
+	fakeClient := newStaleDeleteClient(&staleHeadPodName, testPods[0:1]...)
+
+	podList := corev1.PodList{}
+	require.NoError(t, fakeClient.List(ctx, &podList, client.InNamespace(namespaceStr)))
+	require.Len(t, podList.Items, 1)
+	headPod := podList.Items[0]
+	require.Equal(t, headNodeName, headPod.Name)
+
+	staleHeadPodName = headPod.Name
+	headPod.Status.Phase = corev1.PodFailed
+	require.NoError(t, fakeClient.Status().Update(ctx, &headPod))
+
+	recorder := events.NewFakeRecorder(100)
+	scaleExpectation := expectations.NewRayClusterScaleExpectation(fakeClient)
+	testRayClusterReconciler := &RayClusterReconciler{
+		Client:                     fakeClient,
+		Recorder:                   recorder,
+		Scheme:                     scheme.Scheme,
+		rayClusterScaleExpectation: scaleExpectation,
+	}
+
+	err := testRayClusterReconciler.reconcilePods(ctx, cluster)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, utils.ErrFailedDeleteHeadPod)
+
+	for len(recorder.Events) > 0 {
+		event := <-recorder.Events
+		assert.NotContains(t, event, string(utils.FailedToDeleteHeadPod))
+	}
+
+	assert.False(t, scaleExpectation.IsSatisfied(ctx, namespaceStr, cluster.Name, expectations.HeadGroup))
+
+	require.NoError(t, testRayClusterReconciler.reconcilePods(ctx, cluster))
+	require.NoError(t, fakeClient.List(ctx, &podList, client.InNamespace(namespaceStr)))
+	require.Len(t, podList.Items, 1)
+	assert.Equal(t, headPod.Name, podList.Items[0].Name)
+
+	staleHeadPodName = ""
+	require.NoError(t, fakeClient.Delete(ctx, &headPod))
+	assert.True(t, scaleExpectation.IsSatisfied(ctx, namespaceStr, cluster.Name, expectations.HeadGroup))
+	require.NoError(t, testRayClusterReconciler.reconcilePods(ctx, cluster))
+	require.NoError(t, fakeClient.List(ctx, &podList, client.InNamespace(namespaceStr)))
+	assert.Len(t, podList.Items, 1)
+}
+
+func newStaleDeleteClient(staleName *string, objs ...runtime.Object) client.WithWatch {
+	return clientFake.NewClientBuilder().
+		WithRuntimeObjects(objs...).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if obj.GetName() == *staleName {
+					return k8serrors.NewNotFound(corev1.Resource("pods"), obj.GetName())
+				}
+				return c.Delete(ctx, obj, opts...)
+			},
+		}).
+		Build()
+}
+
 func Test_TerminatedHead_RestartPolicy(t *testing.T) {
 	setupTest(t)
 
