@@ -2223,6 +2223,8 @@ func Test_TerminatedWorkers_NoAutoscaler(t *testing.T) {
 	assert.Len(t, podList.Items, expectedNumWorkerPods)
 }
 
+// Test_UnhealthyWorkerPodAlreadyDeleted checks the case where an unhealthy worker Pod is still in the
+// cache, but the API server returns NotFound when the controller deletes it.
 func Test_UnhealthyWorkerPodAlreadyDeleted(t *testing.T) {
 	setupTest(t)
 
@@ -2259,6 +2261,7 @@ func Test_UnhealthyWorkerPodAlreadyDeleted(t *testing.T) {
 		rayClusterScaleExpectation: scaleExpectation,
 	}
 
+	// NotFound is not treated as a delete failure: no ErrFailedDeleteWorkerPod and no FailedToDeleteWorkerPod event.
 	err := testRayClusterReconciler.reconcilePods(ctx, cluster)
 	require.Error(t, err)
 	require.NotErrorIs(t, err, utils.ErrFailedDeleteWorkerPod)
@@ -2268,14 +2271,19 @@ func Test_UnhealthyWorkerPodAlreadyDeleted(t *testing.T) {
 		assert.NotContains(t, event, string(utils.FailedToDeleteWorkerPod))
 	}
 
+	// A Delete scale expectation is still recorded. It stays unsatisfied while the Pod is still in the cache.
 	assert.False(t, scaleExpectation.IsSatisfied(ctx, namespaceStr, cluster.Name, groupName))
 
+	// Remove the stale Pod from the fake client to mimic the cache catching up.
 	staleFailedPod := podList.Items[0]
 	failedPodName = ""
 	require.NoError(t, fakeClient.Delete(ctx, &staleFailedPod))
 	assert.True(t, scaleExpectation.IsSatisfied(ctx, namespaceStr, cluster.Name, groupName))
 }
 
+// Test_UnhealthyWorkerPodAlreadyDeleted_ContinuesDeleting checks that a NotFound error on one unhealthy
+// worker Pod does not stop the reconcile loop. Two worker Pods are unhealthy, and the first one returns
+// NotFound on delete.
 func Test_UnhealthyWorkerPodAlreadyDeleted_ContinuesDeleting(t *testing.T) {
 	setupTest(t)
 
@@ -2317,16 +2325,21 @@ func Test_UnhealthyWorkerPodAlreadyDeleted_ContinuesDeleting(t *testing.T) {
 	require.Error(t, err)
 	require.NotErrorIs(t, err, utils.ErrFailedDeleteWorkerPod)
 
+	// The second unhealthy Pod is still deleted in the same reconcile.
 	pod := corev1.Pod{}
 	err = fakeClient.Get(ctx, client.ObjectKey{Namespace: namespaceStr, Name: secondFailedPodName}, &pod)
 	assert.True(t, k8serrors.IsNotFound(err), "expected Pod %s to be deleted, got err: %v", secondFailedPodName, err)
 
+	// The stale Pod is still in the fake client because its Delete call was intercepted,
+	// so only one Pod is removed in total.
 	require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Namespace: namespaceStr, Name: staleFailedPodName}, &pod))
 	remaining := corev1.PodList{}
 	require.NoError(t, fakeClient.List(ctx, &remaining, listOptions))
 	assert.Len(t, remaining.Items, len(podList.Items)-1)
 }
 
+// Test_UnhealthyHeadPodAlreadyDeleted checks the case where the unhealthy head Pod is still in the
+// cache, but the API server returns NotFound when the controller deletes it.
 func Test_UnhealthyHeadPodAlreadyDeleted(t *testing.T) {
 	setupTest(t)
 
@@ -2356,6 +2369,7 @@ func Test_UnhealthyHeadPodAlreadyDeleted(t *testing.T) {
 		rayClusterScaleExpectation: scaleExpectation,
 	}
 
+	// NotFound is not treated as a delete failure: no ErrFailedDeleteHeadPod and no FailedToDeleteHeadPod event.
 	err := testRayClusterReconciler.reconcilePods(ctx, cluster)
 	require.Error(t, err)
 	require.NotErrorIs(t, err, utils.ErrFailedDeleteHeadPod)
@@ -2365,13 +2379,18 @@ func Test_UnhealthyHeadPodAlreadyDeleted(t *testing.T) {
 		assert.NotContains(t, event, string(utils.FailedToDeleteHeadPod))
 	}
 
+	// A Delete scale expectation is still recorded. It stays unsatisfied while the head Pod is still in the cache.
 	assert.False(t, scaleExpectation.IsSatisfied(ctx, namespaceStr, cluster.Name, expectations.HeadGroup))
 
+	// While the expectation is unsatisfied, the next reconcile skips the head Pod:
+	// it does not delete or create one, so only the stale head Pod remains.
 	require.NoError(t, testRayClusterReconciler.reconcilePods(ctx, cluster))
 	require.NoError(t, fakeClient.List(ctx, &podList, client.InNamespace(namespaceStr)))
 	require.Len(t, podList.Items, 1)
 	assert.Equal(t, headPod.Name, podList.Items[0].Name)
 
+	// Remove the stale head Pod from the fake client to mimic the cache catching up.
+	// The expectation is then satisfied, and the next reconcile creates a new head Pod.
 	staleHeadPodName = ""
 	require.NoError(t, fakeClient.Delete(ctx, &headPod))
 	assert.True(t, scaleExpectation.IsSatisfied(ctx, namespaceStr, cluster.Name, expectations.HeadGroup))
@@ -2380,6 +2399,11 @@ func Test_UnhealthyHeadPodAlreadyDeleted(t *testing.T) {
 	assert.Len(t, podList.Items, 1)
 }
 
+// newStaleDeleteClient returns a fake client that mimics a stale cache entry.
+// When Delete is called on the Pod named *staleName, it returns NotFound but keeps the Pod in the
+// fake client, so List and Get still return it. This is not how a real client or API server behaves:
+// it only reproduces the case where the cache still has a Pod that is already gone from the API server.
+// Set *staleName to "" to turn this off and let Delete work normally.
 func newStaleDeleteClient(staleName *string, objs ...runtime.Object) client.WithWatch {
 	return clientFake.NewClientBuilder().
 		WithRuntimeObjects(objs...).
